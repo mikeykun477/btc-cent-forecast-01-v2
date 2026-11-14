@@ -94,6 +94,8 @@ def main():
         markets = case.get("markets")
         if not isinstance(markets, list) or len(markets) != 1:
             raise ValueError("%s does not hold exactly one market" % path.name)
+        if "prices" not in markets[0] or not isinstance(markets[0]["prices"], list):
+            raise ValueError("%s market has no prices list" % path.name)
         guess = forecast(markets[0]["prices"])
         out_path = out_dir / (case_id + ".out")
         with out_path.open("w", encoding="utf-8") as f:
