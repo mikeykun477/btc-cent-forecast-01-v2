@@ -15,14 +15,14 @@ mean-reversion, AR(1) or long-window momentum variant I tried scores
 *worse* than persistence. The one exception is a tiny, robust short-horizon
 momentum effect: the last few minutes' move keeps going a little.
 
-    guess = last * exp(0.20 * ln(last / close 5 minutes ago))
+    guess = last * exp(0.22 * ln(last / close 5 minutes ago))
 
-i.e. extrapolate 20% of the last 5-minute log-move. On the same 1,005
-Binance pseudo-cases this scores 39,944 cents (-0.16% vs persistence),
+i.e. extrapolate 22% of the last 5-minute log-move. On the same 1,005
+Binance pseudo-cases this scores 39,943 cents (-0.16% vs persistence),
 better than persistence in *both* halves of the sample, and it also beats
-persistence on the kit's own practice data: 46,293 cents vs 47,055 on the
+persistence on the kit's own practice data: 46,217 cents vs 47,055 on the
 five practice cases whose answers are recoverable from the kit itself
-(p00-p04; the house baseline over all six is 44,522 cents), and 53,659 vs
+(p00-p04; the house baseline over all six is 44,522 cents), and 53,623 vs
 54,020 on 16 hourly pseudo-cases cut from the practice recording.
 
 The effect is small and the model stays close to persistence on purpose:
@@ -51,11 +51,16 @@ MIN_PRICE = 0.00001
 MAX_PRICE = 9_999_999.99999
 
 # Last-5-minute log-move, extrapolated with this damping. Tuned on 45 days
-# of Binance BTCUSDT 1-minute closes (1,005 pseudo-cases): 0.20 was the
-# best of the 0.10/0.15/0.20 grid at a 5-minute window, and the 5-minute
-# window beat 10/15/20/30-minute windows at every scale tried.
+# of Binance BTCUSDT 1-minute closes (1,005 pseudo-cases): 0.22 was the
+# best of the fine 0.10-0.28 grid at a 5-minute window (39,943 cents vs
+# 39,944 at 0.20, 40,007 persistence), and it also improves both
+# cross-checks over 0.20: kit practice 46,217 vs 46,293 cents and 16
+# hourly pseudo-cases from the practice recording 53,623 vs 53,659. The
+# Binance curve is flat in 0.18-0.28, so the scale is kept near the
+# conservative end; the 5-minute window beat 10/15/20/30-minute windows
+# at every scale tried, and a 6-minute window is worse (39,969 at 0.20).
 MOMENTUM_WINDOW = 5      # minutes of recent move to extrapolate
-MOMENTUM_SCALE = 0.20    # fraction of that move carried forward
+MOMENTUM_SCALE = 0.22    # fraction of that move carried forward
 
 
 def price5(x):
