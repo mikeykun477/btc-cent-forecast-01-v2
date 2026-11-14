@@ -1,42 +1,31 @@
 #!/usr/bin/env python3
-"""Forecast Bitcoin's US-dollar price 240 minutes (4 hours) ahead.
+"""BTC 4-hour-ahead price forecast for make.fun's btc-cent-forecast-01.
 
-Entry for make.fun bounty btc-cent-forecast-01.
+Contract: for every <id>.in found in $MAKEFUN_INPUT_DIR (default /input),
+write <id>.out to $MAKEFUN_OUTPUT_DIR (default /output) holding
+{"forecasts": [{"case": "<id>", "price": <number>}]}. One market per case,
+one number per case. Deterministic, standard library only, no network,
+milliseconds per case (limit 8 s).
 
-Method (one number per case: the conditional median, which is the
-MAE-optimal point forecast)
----------------------------------------------------------------
-The score is the mean absolute error in cents, so the best guess is the
-median of the price 240 minutes after the checkpoint. Bitcoin's 4-hour
-returns are, to first order, a martingale: on 45 days of Binance BTCUSDT
-1-minute closes (1,005 pseudo-cases, 72 h of history each, target +240 min)
-persistence (guess = last close) scores 40,007 cents, and every drift,
-mean-reversion, AR(1) or long-window momentum variant I tried scores
-*worse* than persistence. The one exception is a tiny, robust short-horizon
-momentum effect: the last few minutes' move keeps going a little.
+The number is a conditional median, the MAE-optimal point forecast under
+the cent-based absolute-error score. Four-hour BTC returns are close to a
+martingale, so the forecast stays near the last close: persistence alone
+scores 40,007 cents on 45 days of Binance BTCUSDT 1-minute closes (1,005
+pseudo-cases, 72 h of history, +240 min target), while drift, mean
+reversion, AR(1) and longer-window momentum all do worse. The single
+robust exception is a small short-horizon continuation effect, so the
+guess carries forward 22% of the last 5-minute log-move:
 
     guess = last * exp(0.22 * ln(last / close 5 minutes ago))
 
-i.e. extrapolate 22% of the last 5-minute log-move. On the same 1,005
-Binance pseudo-cases this scores 39,943 cents (-0.16% vs persistence),
-better than persistence in *both* halves of the sample, and it also beats
-persistence on the kit's own practice data: 46,217 cents vs 47,055 on the
-five practice cases whose answers are recoverable from the kit itself
-(p00-p04; the house baseline over all six is 44,522 cents), and 53,623 vs
-54,020 on 16 hourly pseudo-cases cut from the practice recording.
-
-The effect is small and the model stays close to persistence on purpose:
-any larger tilt (longer windows, bigger coefficients, drift, reversion)
-loses on the 45-day sample. When the last 5 minutes did not move at all
-- common in this pool, where ~30% of minutes are flat - the guess is
+That scores 39,943 cents on the same 1,005 pseudo-cases (-0.16% against
+persistence, better in both halves), 46,217 vs 47,055 on the five practice
+cases with recoverable answers (p00-p04; house six-case baseline 44,522),
+and 53,623 vs 54,020 on 16 hourly pseudo-cases from the practice tape.
+The tilt is deliberately small: bigger coefficients, longer windows,
+drift or reversion all lose on the 45-day sample. When the last five
+minutes are flat - about 30% of minutes in this pool - the guess is
 exactly the last close.
-
-Deterministic, standard library only, no network, runs in milliseconds
-per case (limit is 8 s).
-
-Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input) and writes
-<id>.out to $MAKEFUN_OUTPUT_DIR (else /output):
-{"forecasts": [{"case": "<id>", "price": <number>}]}.
 """
 
 import json
@@ -44,28 +33,68 @@ import math
 import os
 from pathlib import Path
 
+# Tunables. 0.22 is the argmin of a fine 0.10-0.28 grid at a 5-minute
+# window on the 45-day Binance sample (39,943 cents; 39,944 at 0.20;
+# 40,007 persistence). It also wins both cross-checks over 0.20
+# (practice 46,217 vs 46,293; hourly pseudo-cases 53,623 vs 53,659).
+# The curve is flat across 0.18-0.28, so the scale stays conservative;
+# the 5-minute window beat 10/15/20/30-minute windows at every scale,
+# and a 6-minute window is worse (39,969 at 0.20).
+MOMENTUM_WINDOW = 5
+MOMENTUM_SCALE = 0.22
+
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 MIN_PRICE = 0.00001
 MAX_PRICE = 9_999_999.99999
 
-# Last-5-minute log-move, extrapolated with this damping. Tuned on 45 days
-# of Binance BTCUSDT 1-minute closes (1,005 pseudo-cases): 0.22 was the
-# best of the fine 0.10-0.28 grid at a 5-minute window (39,943 cents vs
-# 39,944 at 0.20, 40,007 persistence), and it also improves both
-# cross-checks over 0.20: kit practice 46,217 vs 46,293 cents and 16
-# hourly pseudo-cases from the practice recording 53,623 vs 53,659. The
-# Binance curve is flat in 0.18-0.28, so the scale is kept near the
-# conservative end; the 5-minute window beat 10/15/20/30-minute windows
-# at every scale tried, and a 6-minute window is worse (39,969 at 0.20).
-MOMENTUM_WINDOW = 5      # minutes of recent move to extrapolate
-MOMENTUM_SCALE = 0.22    # fraction of that move carried forward
+
+def clamp_price(value):
+    """Round value onto the 5-decimal price grid, clamped to (0, 10M)."""
+    return round(min(MAX_PRICE, max(MIN_PRICE, value)) * 1e5) / 1e5
 
 
-def price5(x):
-    """Clamp x to (0, 10,000,000) and round to the grid's 5 decimals."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+def is_valid_price(value):
+    """True when value is a positive finite number usable as a price."""
+    return (
+        isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def tilted_price(last, base):
+    """Last close tilted by a damped share of its recent log-move.
+
+    A base that fails is_valid_price means "no usable history", so the
+    tilt is skipped and the last close is returned unchanged.
+    """
+    if not is_valid_price(base):
+        return last
+    move = math.log(last / base)
+    return last * math.exp(MOMENTUM_SCALE * move)
+
+
+def extract_prices(case, case_name):
+    """Pull the single market's price list out of a parsed case file.
+
+    Raises ValueError naming the case when the shape is wrong, so a bad
+    input fails loudly here instead of crashing deeper in the forecast.
+    """
+    if not isinstance(case, dict):
+        raise ValueError("%s is not a JSON object" % case_name)
+    markets = case.get("markets")
+    if not isinstance(markets, list) or len(markets) != 1:
+        raise ValueError("%s does not hold exactly one market" % case_name)
+    market = markets[0]
+    if (
+        not isinstance(market, dict)
+        or "prices" not in market
+        or not isinstance(market["prices"], list)
+    ):
+        raise ValueError("%s market has no prices list" % case_name)
+    return market["prices"]
 
 
 def forecast(prices):
@@ -73,33 +102,33 @@ def forecast(prices):
     if not prices:
         raise ValueError("market has no prices")
     last = prices[-1]
-    if not isinstance(last, (int, float)) or not math.isfinite(last) or last <= 0:
+    if not is_valid_price(last):
         raise ValueError("last price is not a positive finite number")
     if len(prices) > MOMENTUM_WINDOW:
-        base = prices[-1 - MOMENTUM_WINDOW]
-        if isinstance(base, (int, float)) and math.isfinite(base) and base > 0:
-            move = math.log(last / base)
-            return price5(last * math.exp(MOMENTUM_SCALE * move))
-    return price5(last)
+        return clamp_price(tilted_price(last, prices[-1 - MOMENTUM_WINDOW]))
+    return clamp_price(last)
+
+
+def run_case(path):
+    """Score one case file and write its <id>.out among the outputs."""
+    case_id = path.name[: -len(".in")]
+    with path.open("r", encoding="utf-8") as handle:
+        case = json.load(handle)
+    prices = extract_prices(case, case_id)
+    guess = forecast(prices)
+    out_path = Path(OUTPUT_DIR) / (case_id + ".out")
+    with out_path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"forecasts": [{"case": case_id, "price": guess}]}) + "\n"
+        )
 
 
 def main():
+    """Forecast every case in the input dir, writing one output per case."""
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
-    inputs = sorted(Path(INPUT_DIR).glob("*.in"))
-    for path in inputs:
-        case_id = path.name[: -len(".in")]
-        with path.open("r", encoding="utf-8") as f:
-            case = json.load(f)
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError("%s does not hold exactly one market" % path.name)
-        if "prices" not in markets[0] or not isinstance(markets[0]["prices"], list):
-            raise ValueError("%s market has no prices list" % path.name)
-        guess = forecast(markets[0]["prices"])
-        out_path = out_dir / (case_id + ".out")
-        with out_path.open("w", encoding="utf-8") as f:
-            f.write(json.dumps({"forecasts": [{"case": case_id, "price": guess}]}) + "\n")
+    for path in sorted(Path(INPUT_DIR).glob("*.in")):
+        run_case(path)
 
 
 if __name__ == "__main__":
